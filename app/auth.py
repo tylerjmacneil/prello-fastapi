@@ -13,12 +13,14 @@ ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 if not PROJECT_REF:
     raise RuntimeError("SUPABASE_PROJECT_REF not set")
 
-JWKS_URL = f"https://{PROJECT_REF}.supabase.co/auth/v1/keys"
+# Correct JWKS endpoint for Supabase
+JWKS_URL = f"https://{PROJECT_REF}.supabase.co/auth/v1/.well-known/jwks.json"
 ISSUER = f"https://{PROJECT_REF}.supabase.co/auth/v1"
-AUDIENCE = "authenticated"  # Supabase default audience
+AUDIENCE = "authenticated"  # default audience; we’ll be lenient below
 
 security = HTTPBearer()
 _cache = {"jwks": None, "fetched_at": 0}
+
 
 def _get_jwks():
     """Fetch Supabase JWKS; include anon key headers if the project requires it."""
@@ -33,30 +35,32 @@ def _get_jwks():
         _cache["fetched_at"] = now
     return _cache["jwks"]
 
-def verify_and_get_user_id(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+
+def verify_and_get_user_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
     """
     Verify a Supabase JWT (Authorization: Bearer <token>) and return the user's UUID (sub).
     """
     token = credentials.credentials
     jwks = _get_jwks()
 
-    # Pick the matching key by 'kid'
+    # pick key by 'kid'
     unverified_header = jwt.get_unverified_header(token)
     kid = unverified_header.get("kid")
-    key = next((k for k in jwks["keys"] if k.get("kid") == kid), None)
+    key = next((k for k in jwks.get("keys", []) if k.get("kid") == kid), None)
     if not key:
         raise HTTPException(status_code=401, detail="Signing key not found")
 
     try:
-        # jose accepts a single JWK dict as the key
         claims = jwt.decode(
             token,
-            key,
+            key,                       # pass the single JWK
             algorithms=["RS256"],
             issuer=ISSUER,
             audience=AUDIENCE,
             options={
-                "verify_aud": False,     # some setups omit aud; disable to be forgiving
+                "verify_aud": False,   # be lenient; some tokens omit 'aud'
                 "verify_at_hash": False,
             },
         )
