@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -9,7 +9,7 @@ router = APIRouter()
 
 class ClientCreate(BaseModel):
     name: str
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None   # keep simple (no extra deps)
     phone: Optional[str] = None
     address: Optional[str] = None
 
