@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 SQLAlchemy>=2
 asyncpg
+psycopg[binary]
