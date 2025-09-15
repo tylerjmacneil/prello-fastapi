@@ -1,19 +1,30 @@
 # payments.py
-import os, stripe
+import os
+import logging
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel   # ✅ FIX: import BaseModel
+import stripe
 
 router = APIRouter(prefix="/payments", tags=["payments"])
 
+# Stripe config from env
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
+logger = logging.getLogger("uvicorn")
+
 @router.get("/ping")
 async def ping():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "has_secret_key": bool(stripe.api_key),
+        "has_webhook_secret": bool(WEBHOOK_SECRET),
+    }
 
 @router.post("/webhook")
 async def stripe_webhook(request: Request):
     if not WEBHOOK_SECRET:
+        logger.error("Stripe webhook secret missing (STRIPE_WEBHOOK_SECRET)")
         raise HTTPException(status_code=500, detail="Webhook secret not configured")
 
     payload = await request.body()
@@ -21,27 +32,39 @@ async def stripe_webhook(request: Request):
 
     try:
         event = stripe.Webhook.construct_event(
-            payload=payload, sig_header=sig_header, secret=WEBHOOK_SECRET
+            payload=payload,
+            sig_header=sig_header,
+            secret=WEBHOOK_SECRET
         )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        masked = WEBHOOK_SECRET[:6] + "..." + WEBHOOK_SECRET[-4:] if WEBHOOK_SECRET else "MISSING"
+        logger.error(
+            f"Stripe webhook verify FAILED: {e}; "
+            f"sig_header_present={bool(sig_header)}; "
+            f"secret={masked}"
+        )
+        raise HTTPException(status_code=400, detail="signature verification failed")
 
-    # Temporary log handling
-    if event["type"] == "checkout.session.completed":
-        print("✅ Checkout session completed")
-    elif event["type"] == "payment_intent.succeeded":
-        print("✅ Payment succeeded")
+    etype = event.get("type")
+    logger.info(f"Stripe webhook received: {etype}")
+
+    if etype == "checkout.session.completed":
+        sess = event["data"]["object"]
+        logger.info(f"✅ checkout.session.completed for session {sess.get('id')}")
+    elif etype == "payment_intent.succeeded":
+        intent = event["data"]["object"]
+        logger.info(f"✅ payment_intent.succeeded for intent {intent.get('id')}")
 
     return {"ok": True}
-    from pydantic import BaseModel
 
+# --------- New endpoint: create checkout session ---------
 class CheckoutPayload(BaseModel):
     job_id: str
     amount_cents: int
     currency: str = "cad"
     customer_email: str
-    success_url: str  # e.g., prello://payment-success?job_id=...
-    cancel_url: str   # e.g., prello://payment-cancel?job_id=...
+    success_url: str
+    cancel_url: str
 
 @router.post("/checkout")
 async def create_checkout_session(body: CheckoutPayload):
@@ -71,4 +94,3 @@ async def create_checkout_session(body: CheckoutPayload):
 
     logger.info(f"Created checkout session {session.get('id')} for job {body.job_id}")
     return {"checkout_url": session.get("url"), "session_id": session.get("id")}
-
