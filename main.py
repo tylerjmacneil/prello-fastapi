@@ -11,3 +11,6 @@ def read_root():
 app.include_router(health.router, prefix="/health", tags=["health"])
 app.include_router(clients.router, prefix="/clients", tags=["clients"])
 
+from payments import router as payments_router   # add near the top
+
+app.include_router(payments_router)              # add after app creation
