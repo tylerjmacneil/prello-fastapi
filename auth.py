@@ -3,21 +3,23 @@ import os
 import httpx
 from fastapi import Header, HTTPException
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-
 async def get_current_user(authorization: str = Header(...)):
     """Verify the Supabase user JWT sent from the iOS app."""
     if not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing Bearer token")
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    if not supabase_url:
+        raise HTTPException(status_code=500, detail="SUPABASE_URL not configured")
+
     token = authorization.split(" ", 1)[1]
 
-    # Ask Supabase to validate the token and return the user
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
-            f"{SUPABASE_URL}/auth/v1/user",
+            f"{supabase_url}/auth/v1/user",
             headers={
                 "Authorization": f"Bearer {token}",
-                "apikey": token,  # Supabase accepts the user JWT as apikey here
+                "apikey": token,  # Supabase accepts the user JWT here
             },
         )
 
