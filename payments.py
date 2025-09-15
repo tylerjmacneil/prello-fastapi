@@ -94,3 +94,6 @@ async def create_checkout_session(body: CheckoutPayload):
 
     logger.info(f"Created checkout session {session.get('id')} for job {body.job_id}")
     return {"checkout_url": session.get("url"), "session_id": session.get("id")}
+
+from fastapi import APIRouter, HTTPException, Request, Depends  # add Depends
+from auth import get_current_user  # new
