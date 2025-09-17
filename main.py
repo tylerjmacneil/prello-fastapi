@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import os
+import logging
+import importlib
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# ──────────────────────────────────────────────────────────────────────────────
-# App
-# ──────────────────────────────────────────────────────────────────────────────
+log = logging.getLogger("uvicorn.error")
+
 app = FastAPI(
     title="Prello API",
     version="0.1.0",
@@ -17,39 +18,34 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# CORS (relax for now; tighten when you have fixed app domains)
+# ---------------------------
+# CORS (relaxed for now)
+# ---------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # e.g., ["https://prello.app", "http://localhost:5173"]
+    allow_origins=["*"],     # tighten later (e.g. your domains)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Root + Health
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------
+# Root & Health
+# ---------------------------
 @app.get("/", tags=["default"])
 def read_root():
     return {"ok": True, "service": "prello-api"}
 
 @app.get("/health/db", tags=["health"])
 def health_db():
-    """
-    Quick DB health check using Supabase service role.
-    Set env in Railway:
-      SUPABASE_URL, SUPABASE_SERVICE_ROLE
-    """
+    """Ping Supabase using service role (set SUPABASE_URL & SUPABASE_SERVICE_ROLE in Railway)."""
     try:
-        from supabase import create_client  # lazy import to avoid startup error if not installed
-
+        from supabase import create_client  # lazy import
         url = os.environ.get("SUPABASE_URL")
         key = os.environ.get("SUPABASE_SERVICE_ROLE")
         if not url or not key:
             raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE")
-
         client = create_client(url, key)
-        # Cheap ping: select 1 row from clients (or any table you have)
         resp = client.table("clients").select("id").limit(1).execute()
         if resp.error:
             raise RuntimeError(resp.error.message)
@@ -57,36 +53,48 @@ def health_db():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB check failed: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Routers
-# ──────────────────────────────────────────────────────────────────────────────
-# New Jobs router (you created this in routers/jobs.py)
-try:
-    from routers import jobs  # noqa: E402
-    app.include_router(jobs.router)  # mounts at /jobs/
-except Exception as e:
-    # Don’t crash if the file isn’t present yet; still serve / and /health/db
-    print(f"[main] jobs router not loaded: {e}")
+# ---------------------------
+# Router loader (robust)
+# ---------------------------
+def include_router_dynamically(candidates: list[str], name: str) -> None:
+    """
+    Try multiple module paths until one works.
+    Each module must expose a FastAPI 'router' object.
+    """
+    last_err: Optional[Exception] = None
+    for module_path in candidates:
+        try:
+            mod = importlib.import_module(module_path)
+            rtr = getattr(mod, "router")
+            app.include_router(rtr)
+            log.info(f"[main] Included router: {module_path} as {name}")
+            return
+        except Exception as e:
+            last_err = e
+            log.warning(f"[main] Failed to include {module_path}: {e}")
+    log.error(f"[main] Could not include {name} router. Tried: {candidates}. Last error: {last_err}")
 
-# Optional: keep existing routers if you already have them
-try:
-    from routers import clients  # noqa: E402
-    app.include_router(clients.router)  # e.g., /clients/
-except Exception as e:
-    print(f"[main] clients router not loaded: {e}")
+# IMPORTANT: ensure your project has routers/<name>.py and routers/__init__.py
+# Try both relative ('routers.*') and app-qualified ('app.routers.*') import styles.
+include_router_dynamically(
+    ["routers.clients", "app.routers.clients"],
+    name="clients",
+)
+include_router_dynamically(
+    ["routers.payments", "app.routers.payments"],
+    name="payments",
+)
+include_router_dynamically(
+    ["routers.jobs", "app.routers.jobs"],
+    name="jobs",
+)
 
-try:
-    from routers import payments  # noqa: E402
-    app.include_router(payments.router)  # e.g., /payments/*
-except Exception as e:
-    print(f"[main] payments router not loaded: {e}")
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Local dev entrypoint (Railway typically uses a Procfile / start command)
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------
+# Local dev entrypoint
+# ---------------------------
 if __name__ == "__main__":
     import uvicorn
-
+    logging.basicConfig(level=logging.INFO)
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
