@@ -22,7 +22,7 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS
+# CORS (relaxed for now; tighten to your domains later)
 # ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +41,7 @@ def read_root():
 
 @app.get("/health/db", tags=["health"])
 def health_db():
+    """Ping Supabase using service role (set SUPABASE_URL & SUPABASE_SERVICE_ROLE in Railway)."""
     try:
         client = _get_supabase()
         resp = client.table("clients").select("id").limit(1).execute()
@@ -51,24 +52,26 @@ def health_db():
         raise HTTPException(status_code=503, detail=f"DB check failed: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Diagnostics (to explain 500s)
+# Diagnostics (to explain 500s quickly)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/diag", tags=["health"])
 def diag():
-    out = {"supabase_url_set": bool(os.environ.get("SUPABASE_URL")),
-           "service_role_set": bool(os.environ.get("SUPABASE_SERVICE_ROLE")),
-           "errors": []}
+    out = {
+        "supabase_url_set": bool(os.environ.get("SUPABASE_URL")),
+        "service_role_set": bool(os.environ.get("SUPABASE_SERVICE_ROLE")),
+        "errors": [],
+    }
     try:
         client = _get_supabase()
     except Exception as e:
         out["errors"].append(f"supabase init: {e}")
         return out
 
-    # Check tables & columns we rely on
-    for table, cols in {
+    checks = {
         "clients": "id,name,email,phone,address,created_at",
         "jobs":    "id,client_id,title,description,price_cents,status,created_at",
-    }.items():
+    }
+    for table, cols in checks.items():
         try:
             resp = client.table(table).select(cols).limit(1).execute()
             if resp.error:
@@ -89,7 +92,7 @@ def _get_supabase() -> Client:
     return create_client(url, key)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Models
+# Models (emails as plain strings to avoid extra dependency)
 # ──────────────────────────────────────────────────────────────────────────────
 class ApiClient(BaseModel):
     id: UUID
@@ -140,7 +143,7 @@ def _row_to_job(row: Dict[str, Any]) -> ApiJob:
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jobs endpoints (with detailed error messages)
+# Jobs endpoints (inline so they ALWAYS appear in Swagger)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/jobs/", tags=["jobs"], response_model=List[ApiJob])
 def list_jobs():
@@ -159,15 +162,14 @@ def list_jobs():
     except HTTPException:
         raise
     except Exception as e:
-        # Surface exact reason so your app shows it
         raise HTTPException(status_code=500, detail=f"/jobs/ GET failed: {e}")
 
-@app.post("/jobs/", tags=["jobs"], response_model=ApiJob])
+@app.post("/jobs/", tags=["jobs"], response_model=ApiJob)
 def create_job(payload: JobCreate):
     try:
         client = _get_supabase()
 
-        # 1) upsert client by name
+        # 1) find or create client by name (simple upsert)
         existing = (
             client.table("clients")
             .select("id,name,email,phone,address,created_at")
