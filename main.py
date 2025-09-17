@@ -7,7 +7,7 @@ from typing import Optional, List, Dict, Any
 from uuid import UUID
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client, Client
@@ -22,7 +22,7 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS (relaxed for now; tighten to your domains later)
+# CORS (relaxed for now; lock down later)
 # ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -41,18 +41,17 @@ def read_root():
 
 @app.get("/health/db", tags=["health"])
 def health_db():
-    """Ping Supabase using service role (set SUPABASE_URL & SUPABASE_SERVICE_ROLE in Railway)."""
+    """Ping Supabase using service role (set SUPABASE_URL & SUPABASE_SERVICE_ROLE)."""
     try:
         client = _get_supabase()
         resp = client.table("clients").select("id").limit(1).execute()
-        if resp.error:
-            raise RuntimeError(resp.error.message)
+        _ = getattr(resp, "data", None)  # access to force eval; exceptions will raise
         return {"ok": True, "db": "up"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB check failed: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Diagnostics (to explain 500s quickly)
+# Diagnostics
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/diag", tags=["health"])
 def diag():
@@ -74,8 +73,7 @@ def diag():
     for table, cols in checks.items():
         try:
             resp = client.table(table).select(cols).limit(1).execute()
-            if resp.error:
-                out["errors"].append(f"{table} select error: {resp.error.message}")
+            _ = getattr(resp, "data", None)
         except Exception as e:
             out["errors"].append(f"{table} select exception: {e}")
 
@@ -92,7 +90,7 @@ def _get_supabase() -> Client:
     return create_client(url, key)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Models (emails as plain strings to avoid extra dependency)
+# Models (emails as plain strings)
 # ──────────────────────────────────────────────────────────────────────────────
 class ApiClient(BaseModel):
     id: UUID
@@ -143,7 +141,7 @@ def _row_to_job(row: Dict[str, Any]) -> ApiJob:
     )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jobs endpoints (inline so they ALWAYS appear in Swagger)
+# Jobs endpoints (Supabase v2 style: rely on exceptions, use .data)
 # ──────────────────────────────────────────────────────────────────────────────
 @app.get("/jobs/", tags=["jobs"], response_model=List[ApiJob])
 def list_jobs():
@@ -151,16 +149,15 @@ def list_jobs():
         client = _get_supabase()
         resp = (
             client.table("jobs")
-            .select("id,client_id,title,description,price_cents,status,created_at,client:clients(id,name,email,phone,address,created_at)")
+            .select(
+                "id,client_id,title,description,price_cents,status,created_at,"
+                "client:clients(id,name,email,phone,address,created_at)"
+            )
             .order("created_at", desc=True)
             .execute()
         )
-        if resp.error:
-            raise HTTPException(status_code=500, detail=f"jobs select error: {resp.error.message}")
-        rows = resp.data or []
+        rows = getattr(resp, "data", []) or []
         return [_row_to_job(r) for r in rows]
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"/jobs/ GET failed: {e}")
 
@@ -169,33 +166,31 @@ def create_job(payload: JobCreate):
     try:
         client = _get_supabase()
 
-        # 1) find or create client by name (simple upsert)
-        existing = (
+        # Find client by name
+        existing_resp = (
             client.table("clients")
             .select("id,name,email,phone,address,created_at")
             .eq("name", payload.client_name)
             .limit(1)
             .execute()
         )
-        if existing.error:
-            raise HTTPException(status_code=500, detail=f"clients select error: {existing.error.message}")
-
-        if existing.data:
-            client_row = existing.data[0]
+        existing_rows = getattr(existing_resp, "data", []) or []
+        if existing_rows:
+            client_row = existing_rows[0]
         else:
-            ins_client = (
+            ins_client_resp = (
                 client.table("clients")
                 .insert({"name": payload.client_name, "email": payload.client_email})
                 .select("id,name,email,phone,address,created_at")
                 .single()
                 .execute()
             )
-            if ins_client.error:
-                raise HTTPException(status_code=500, detail=f"clients insert error: {ins_client.error.message}")
-            client_row = ins_client.data
+            client_row = getattr(ins_client_resp, "data", None)
+            if not isinstance(client_row, dict):
+                raise RuntimeError("clients insert returned no data")
 
-        # 2) insert job
-        ins_job = (
+        # Insert job
+        ins_job_resp = (
             client.table("jobs")
             .insert({
                 "client_id": client_row["id"],
@@ -208,15 +203,13 @@ def create_job(payload: JobCreate):
             .single()
             .execute()
         )
-        if ins_job.error:
-            raise HTTPException(status_code=500, detail=f"jobs insert error: {ins_job.error.message}")
+        job_row = getattr(ins_job_resp, "data", None)
+        if not isinstance(job_row, dict):
+            raise RuntimeError("jobs insert returned no data")
 
-        job_row = ins_job.data
         job_row["client"] = client_row
         return _row_to_job(job_row)
 
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"/jobs/ POST failed: {e}")
 
@@ -232,4 +225,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", "8000")),
         reload=True,
     )
-
