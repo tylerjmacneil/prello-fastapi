@@ -14,3 +14,8 @@ app.include_router(clients.router, prefix="/clients", tags=["clients"])
 from payments import router as payments_router   # add near the top
 
 app.include_router(payments_router)              # add after app creation
+from fastapi import FastAPI
+from . import jobs
+
+app = FastAPI()
+app.include_router(jobs.router)
