@@ -18,20 +18,20 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# ---------------------------
-# CORS (relaxed for now)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# CORS (relaxed for now; tighten later)
+# ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],     # tighten later (e.g. your domains)
+    allow_origins=["*"],          # e.g. ["https://prello.app", "http://localhost:5173"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------------------------
-# Root & Health
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Root + Health
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/", tags=["default"])
 def read_root():
     return {"ok": True, "service": "prello-api"}
@@ -53,13 +53,13 @@ def health_db():
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"DB check failed: {e}")
 
-# ---------------------------
-# Router loader (robust)
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Dynamic router loader
+# ──────────────────────────────────────────────────────────────────────────────
 def include_router_dynamically(candidates: list[str], name: str) -> None:
     """
-    Try multiple module paths until one works.
-    Each module must expose a FastAPI 'router' object.
+    Try multiple module paths until one works. Each module must expose a `router`.
+    Logs failures but keeps the app up.
     """
     last_err: Optional[Exception] = None
     for module_path in candidates:
@@ -74,24 +74,26 @@ def include_router_dynamically(candidates: list[str], name: str) -> None:
             log.warning(f"[main] Failed to include {module_path}: {e}")
     log.error(f"[main] Could not include {name} router. Tried: {candidates}. Last error: {last_err}")
 
-# IMPORTANT: ensure your project has routers/<name>.py and routers/__init__.py
-# Try both relative ('routers.*') and app-qualified ('app.routers.*') import styles.
+# Ensure `routers` is a package (create an empty routers/__init__.py if missing)
+# Load routers from several likely locations based on your repo screenshot.
 include_router_dynamically(
-    ["routers.clients", "app.routers.clients"],
+    ["routers.clients", "clients", "app.routers.clients", "app.clients"],
     name="clients",
 )
 include_router_dynamically(
-    ["routers.payments", "app.routers.payments"],
+    # You have payments.py at repo root; try that first
+    ["payments", "routers.payments", "app.routers.payments", "app.payments"],
     name="payments",
 )
 include_router_dynamically(
-    ["routers.jobs", "app.routers.jobs"],
+    # You moved jobs to routers/jobs.py; this will pick it up
+    ["routers.jobs", "jobs", "app.routers.jobs", "app.jobs"],
     name="jobs",
 )
 
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Local dev entrypoint
-# ---------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO)
