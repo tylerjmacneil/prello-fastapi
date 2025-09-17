@@ -3,14 +3,13 @@ from __future__ import annotations
 
 import os
 import logging
-import importlib
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from supabase import create_client, Client
 
 log = logging.getLogger("uvicorn.error")
@@ -23,7 +22,7 @@ app = FastAPI(
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CORS (relaxed for now; tighten later)
+# CORS
 # ──────────────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -42,13 +41,8 @@ def read_root():
 
 @app.get("/health/db", tags=["health"])
 def health_db():
-    """Ping Supabase using service role (set SUPABASE_URL & SUPABASE_SERVICE_ROLE in Railway)."""
     try:
-        url = os.environ.get("SUPABASE_URL")
-        key = os.environ.get("SUPABASE_SERVICE_ROLE")
-        if not url or not key:
-            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE")
-        client = create_client(url, key)
+        client = _get_supabase()
         resp = client.table("clients").select("id").limit(1).execute()
         if resp.error:
             raise RuntimeError(resp.error.message)
@@ -57,22 +51,50 @@ def health_db():
         raise HTTPException(status_code=503, detail=f"DB check failed: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Supabase (server-side) helper
+# Diagnostics (to explain 500s)
 # ──────────────────────────────────────────────────────────────────────────────
-def get_supabase() -> Client:
+@app.get("/diag", tags=["health"])
+def diag():
+    out = {"supabase_url_set": bool(os.environ.get("SUPABASE_URL")),
+           "service_role_set": bool(os.environ.get("SUPABASE_SERVICE_ROLE")),
+           "errors": []}
+    try:
+        client = _get_supabase()
+    except Exception as e:
+        out["errors"].append(f"supabase init: {e}")
+        return out
+
+    # Check tables & columns we rely on
+    for table, cols in {
+        "clients": "id,name,email,phone,address,created_at",
+        "jobs":    "id,client_id,title,description,price_cents,status,created_at",
+    }.items():
+        try:
+            resp = client.table(table).select(cols).limit(1).execute()
+            if resp.error:
+                out["errors"].append(f"{table} select error: {resp.error.message}")
+        except Exception as e:
+            out["errors"].append(f"{table} select exception: {e}")
+
+    return out
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Supabase helper
+# ──────────────────────────────────────────────────────────────────────────────
+def _get_supabase() -> Client:
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_SERVICE_ROLE")
     if not url or not key:
-        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE")
+        raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE")
     return create_client(url, key)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Jobs models + endpoints (INLINE to guarantee they appear)
+# Models
 # ──────────────────────────────────────────────────────────────────────────────
 class ApiClient(BaseModel):
     id: UUID
     name: str
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     phone: Optional[str] = None
     address: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -89,7 +111,7 @@ class ApiJob(BaseModel):
 
 class JobCreate(BaseModel):
     client_name: str = Field(..., min_length=1)
-    client_email: Optional[EmailStr] = None
+    client_email: Optional[str] = None
     title: str = Field(..., min_length=1)
     description: Optional[str] = None
     price_cents: int = Field(..., ge=0)
@@ -117,87 +139,84 @@ def _row_to_job(row: Dict[str, Any]) -> ApiJob:
         client=client,
     )
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Jobs endpoints (with detailed error messages)
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/jobs/", tags=["jobs"], response_model=List[ApiJob])
-def list_jobs(supabase: Client = Depends(get_supabase)):
-    resp = (
-        supabase.table("jobs")
-        .select("id,client_id,title,description,price_cents,status,created_at,client:clients(id,name,email,phone,address,created_at)")
-        .order("created_at", desc=True)
-        .execute()
-    )
-    if resp.error:
-        raise HTTPException(status_code=500, detail=resp.error.message)
-    rows = resp.data or []
-    return [_row_to_job(r) for r in rows]
+def list_jobs():
+    try:
+        client = _get_supabase()
+        resp = (
+            client.table("jobs")
+            .select("id,client_id,title,description,price_cents,status,created_at,client:clients(id,name,email,phone,address,created_at)")
+            .order("created_at", desc=True)
+            .execute()
+        )
+        if resp.error:
+            raise HTTPException(status_code=500, detail=f"jobs select error: {resp.error.message}")
+        rows = resp.data or []
+        return [_row_to_job(r) for r in rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface exact reason so your app shows it
+        raise HTTPException(status_code=500, detail=f"/jobs/ GET failed: {e}")
 
-@app.post("/jobs/", tags=["jobs"], response_model=ApiJob)
-def create_job(payload: JobCreate, supabase: Client = Depends(get_supabase)):
-    # upsert client-by-name
-    existing = (
-        supabase.table("clients")
-        .select("id,name,email,phone,address,created_at")
-        .eq("name", payload.client_name)
-        .limit(1)
-        .execute()
-    )
-    if existing.error:
-        raise HTTPException(status_code=500, detail=existing.error.message)
+@app.post("/jobs/", tags=["jobs"], response_model=ApiJob])
+def create_job(payload: JobCreate):
+    try:
+        client = _get_supabase()
 
-    if existing.data:
-        client_row = existing.data[0]
-    else:
-        ins_client = (
-            supabase.table("clients")
-            .insert({"name": payload.client_name, "email": payload.client_email})
+        # 1) upsert client by name
+        existing = (
+            client.table("clients")
             .select("id,name,email,phone,address,created_at")
+            .eq("name", payload.client_name)
+            .limit(1)
+            .execute()
+        )
+        if existing.error:
+            raise HTTPException(status_code=500, detail=f"clients select error: {existing.error.message}")
+
+        if existing.data:
+            client_row = existing.data[0]
+        else:
+            ins_client = (
+                client.table("clients")
+                .insert({"name": payload.client_name, "email": payload.client_email})
+                .select("id,name,email,phone,address,created_at")
+                .single()
+                .execute()
+            )
+            if ins_client.error:
+                raise HTTPException(status_code=500, detail=f"clients insert error: {ins_client.error.message}")
+            client_row = ins_client.data
+
+        # 2) insert job
+        ins_job = (
+            client.table("jobs")
+            .insert({
+                "client_id": client_row["id"],
+                "title": payload.title,
+                "description": payload.description,
+                "price_cents": payload.price_cents,
+                "status": "active_unscheduled",
+            })
+            .select("id,client_id,title,description,price_cents,status,created_at")
             .single()
             .execute()
         )
-        if ins_client.error:
-            raise HTTPException(status_code=500, detail=ins_client.error.message)
-        client_row = ins_client.data
+        if ins_job.error:
+            raise HTTPException(status_code=500, detail=f"jobs insert error: {ins_job.error.message}")
 
-    ins_job = (
-        supabase.table("jobs")
-        .insert({
-            "client_id": client_row["id"],
-            "title": payload.title,
-            "description": payload.description,
-            "price_cents": payload.price_cents,
-            "status": "active_unscheduled",
-        })
-        .select("id,client_id,title,description,price_cents,status,created_at")
-        .single()
-        .execute()
-    )
-    if ins_job.error:
-        raise HTTPException(status_code=500, detail=ins_job.error.message)
+        job_row = ins_job.data
+        job_row["client"] = client_row
+        return _row_to_job(job_row)
 
-    job_row = ins_job.data
-    job_row["client"] = client_row
-    return _row_to_job(job_row)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Try to include your existing routers (optional)
-# ──────────────────────────────────────────────────────────────────────────────
-def include_router_dynamically(candidates: list[str], name: str) -> None:
-    last_err: Optional[Exception] = None
-    for module_path in candidates:
-        try:
-            mod = importlib.import_module(module_path)
-            rtr = getattr(mod, "router")
-            app.include_router(rtr)
-            log.info(f"[main] Included router: {module_path} as {name}")
-            return
-        except Exception as e:
-            last_err = e
-            log.warning(f"[main] Failed to include {module_path}: {e}")
-    if last_err:
-        log.warning(f"[main] Could not include {name} router; continuing. Tried: {candidates}. Last error: {last_err}")
-
-# These are optional; main endpoints above are already active
-include_router_dynamically(["routers.clients", "clients", "app.routers.clients", "app.clients"], "clients")
-include_router_dynamically(["payments", "routers.payments", "app.routers.payments", "app.payments"], "payments")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"/jobs/ POST failed: {e}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Local dev entrypoint
@@ -211,3 +230,4 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", "8000")),
         reload=True,
     )
+
